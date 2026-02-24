@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from .models import SignupReq, LoginReq, ChatReq, ChatResp, MemoryCitation
 from .auth import init_auth_db, create_user, verify_user, new_session, user_from_session
 from .neo4j_client import Neo4jClient
-from .memory import should_store_memory, make_memory
+from .memory import make_memory
 from .llm_gemini import gemini_answer
 from .config import GEMINI_API_KEY
 from .utils import timed
@@ -52,15 +52,15 @@ def chat(req: ChatReq):
     if not user_id:
         raise HTTPException(status_code=401, detail="invalid session")
 
-    memories = []
+    # 1) Retrieve memories FIRST
     with timed("retrieve_memories", trace):
         memories = neo.get_memories(user_id, limit=12)
 
-    # build context pack (ONLY this user's memories)
+    # 2) Build prompt from retrieved memories
     context_lines = [f"- ({m['kind']}) {m['text']} [id={m['memory_id']}]" for m in memories]
     prompt = f"""
 You are an interview prep assistant. Use ONLY the provided user memory context.
-If context is insufficient, ask a clarifying question.
+If context is insufficient, still answer normally using general knowledge, and ask 1 clarifying question if needed.
 
 User memory context:
 {chr(10).join(context_lines)}
@@ -69,15 +69,46 @@ User message:
 {req.message}
 """.strip()
 
+    # 3) Call Gemini once
     with timed("llm_call_gemini", trace):
-        answer = gemini_answer(GEMINI_API_KEY, prompt)
+        try:
+            answer = gemini_answer(GEMINI_API_KEY, prompt)
+        except Exception as e:
+            answer = f"[LLM ERROR] {str(e)}"
 
-    with timed("maybe_store_memory", trace):
-        ok, kind = should_store_memory(req.message)
-        if ok:
-            neo.add_memory(user_id, make_memory(req.message, kind=kind, source="chat"))
+    # 4) Extract "important memories" (Gemini)
+    from .llm_gemini import gemini_extract_memories
 
-    # citations = memories used (for now, just return top few retrieved)
+    MEMORY_CONF_THRESHOLD = 0.75
+    ALLOWED_KINDS = {"fact", "goal", "preference", "weakness", "strength", "constraint"}
+
+    with timed("extract_memories_llm", trace):
+        extracted = []
+        try:
+            extracted = gemini_extract_memories(GEMINI_API_KEY, req.message)
+        except Exception as e:
+            trace.append({"stage": "extract_memories_llm", "status": "error", "error": str(e)})
+
+    # 5) Store extracted memories
+    with timed("store_memories", trace):
+        stored = []
+        for m in extracted:
+            try:
+                text = (m.get("text") or "").strip()
+                kind = (m.get("kind") or "").strip()
+                conf = float(m.get("confidence") or 0.0)
+
+                if not text or kind not in ALLOWED_KINDS or conf < MEMORY_CONF_THRESHOLD:
+                    continue
+
+                neo.add_memory(user_id, make_memory(text, kind=kind, source="chat", confidence=conf))
+                stored.append({"text": text, "kind": kind, "confidence": conf})
+            except Exception as e:
+                trace.append({"stage": "store_memories", "status": "error", "error": str(e), "item": m})
+
+    trace.append({"stage": "stored_memories", "status": "ok", "count": len(stored), "items": stored[:5]})
+
+    # 6) Citations = retrieved memories (top few)
     citations = []
     for i, m in enumerate(memories[:5]):
         citations.append(MemoryCitation(
@@ -86,9 +117,16 @@ User message:
             score=1.0 - (i * 0.05)
         ))
 
-    # read timings from trace
-    retrieval_ms = next((x["ms"] for x in trace if x["stage"] == "retrieve_memories" and x["status"] == "ok"), 0)
-    llm_ms = next((x["ms"] for x in trace if x["stage"] == "llm_call_gemini" and x["status"] == "ok"), 0)
+    # 7) timings
+    def last_ms(stage: str) -> int:
+        ms = 0
+        for x in trace:
+            if x.get("stage") == stage and x.get("status") == "ok":
+                ms = int(x.get("ms", 0))
+        return ms
+
+    retrieval_ms = last_ms("retrieve_memories")
+    llm_ms = last_ms("llm_call_gemini")
 
     return ChatResp(
         answer=answer,
