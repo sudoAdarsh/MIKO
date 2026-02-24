@@ -7,7 +7,7 @@ AUTH_DB_PATH = Path(__file__).resolve().parent.parent / "auth.db"
 SESSIONS = {}  # session_token -> user_id (hackathon only)
 
 def init_auth_db():
-    conn = sqlite3.connect(AUTH_DB_PATH)
+    conn = sqlite3.connect(AUTH_DB_PATH, timeout=10)
     print("AUTH_DB_PATH =", AUTH_DB_PATH)
     cur = conn.cursor()
     cur.execute("""
@@ -24,7 +24,7 @@ def create_user(username: str, password: str) -> str:
     user_id = str(uuid.uuid4())
     pw_hash = pbkdf2_sha256.hash(password)
 
-    conn = sqlite3.connect(AUTH_DB_PATH)
+    conn = sqlite3.connect(AUTH_DB_PATH, timeout=10)
     cur = conn.cursor()
     cur.execute("INSERT INTO users(user_id, username, password_hash) VALUES(?,?,?)",
                 (user_id, username, pw_hash))
@@ -33,7 +33,7 @@ def create_user(username: str, password: str) -> str:
     return user_id
 
 def verify_user(username: str, password: str) -> str | None:
-    conn = sqlite3.connect(AUTH_DB_PATH)
+    conn = sqlite3.connect(AUTH_DB_PATH, timeout=10)
     cur = conn.cursor()
     cur.execute("SELECT user_id, password_hash FROM users WHERE username=?", (username,))
     row = cur.fetchone()
