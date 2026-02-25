@@ -52,6 +52,8 @@ with col1:
             if r.status_code == 200 and "session_token" in data:
                 st.session_state["session_token"] = data["session_token"]
                 st.session_state["user_id"] = data["user_id"]
+                st.session_state["chat_log"] = []
+                st.session_state["msg"] = ""
                 st.success("Logged in!")
             else:
                 st.error("Login failed.")
@@ -60,6 +62,13 @@ with col2:
     st.subheader("Session")
     st.write("Logged in user_id:", st.session_state["user_id"])
     st.write("session_token:", st.session_state["session_token"])
+
+    if st.button("Logout / Reset UI"):
+        st.session_state["session_token"] = None
+        st.session_state["user_id"] = None
+        st.session_state["chat_log"] = []
+        st.session_state["msg"] = ""
+        st.rerun()
 
 st.divider()
 st.subheader("Chat")
@@ -113,3 +122,32 @@ st.subheader("Chat log (this UI session)")
 for i, turn in enumerate(st.session_state["chat_log"][-5:], start=1):
     st.markdown(f"**{i}. You:** {turn['user']}")
     st.markdown(f"**Assistant:** {turn['answer']}")
+
+st.divider()
+st.subheader("LLM Debug (Groq)")
+
+# get last backend response safely (from chat_log)
+last_raw = None
+if st.session_state["chat_log"]:
+    last_raw = st.session_state["chat_log"][-1].get("raw")
+
+if not last_raw:
+    st.info("Send a message first to see Groq debug info.")
+else:
+    llm_dbg = None
+    for item in last_raw.get("debug_trace", []):
+        if item.get("stage") == "groq_io" and item.get("status") == "ok":
+            llm_dbg = item
+            break
+
+    if llm_dbg:
+        st.write("Model:", llm_dbg.get("model"))
+        st.write("Usage:", llm_dbg.get("usage", {}))
+
+        with st.expander("Prompt sent to Groq"):
+            st.code(llm_dbg.get("prompt_preview", ""), language="text")
+
+        with st.expander("Raw model output"):
+            st.code(llm_dbg.get("raw_preview", ""), language="text")
+    else:
+        st.info("No groq_io block found in debug_trace for the last message.")

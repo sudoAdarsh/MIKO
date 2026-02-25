@@ -3,8 +3,8 @@ from .models import SignupReq, LoginReq, ChatReq, ChatResp, MemoryCitation
 from .auth import init_auth_db, create_user, verify_user, new_session, user_from_session
 from .neo4j_client import Neo4jClient
 from .memory import make_memory
-from .llm_gemini import gemini_answer
-from .config import GEMINI_API_KEY
+from .llm_groq import groq_answer_and_memories
+from .config import GROQ_API_KEY, GROQ_MODEL
 from .utils import timed
 
 app = FastAPI()
@@ -49,18 +49,42 @@ def login(req: LoginReq):
 def chat(req: ChatReq):
     trace = []
     user_id = user_from_session(req.session_token)
+    trace.append({
+        "stage": "auth_scope",
+        "status": "ok",
+        "user_id": user_id,
+        "session_token_prefix": req.session_token[:8]
+    })
     if not user_id:
         raise HTTPException(status_code=401, detail="invalid session")
 
-    # 1) Retrieve memories FIRST
+    # 1) Retrieve memories
     with timed("retrieve_memories", trace):
         memories = neo.get_memories(user_id, limit=12)
 
-    # 2) Build prompt from retrieved memories
+    # 2) Build prompt with strict JSON contract
     context_lines = [f"- ({m['kind']}) {m['text']} [id={m['memory_id']}]" for m in memories]
+
     prompt = f"""
-You are an interview prep assistant. Use ONLY the provided user memory context.
-If context is insufficient, still answer normally using general knowledge, and ask 1 clarifying question if needed.
+Return STRICT JSON only (no markdown, no extra text) with this shape:
+{{
+  "answer": "string",
+  "memories": [
+    {{"text": "string", "kind": "fact|goal|preference|weakness|strength|constraint", "confidence": 0.0}}
+  ]
+}}
+
+Answer rules:
+- Give a helpful, complete answer (normally 10-15 lines) around 150–250 words.
+- Use bullets/steps when useful.
+- If the user asks something vague, ask 1 clarifying question at the end.
+
+Memory rules:
+- Extract ONLY durable user-specific info worth saving for future personalization.
+- Max 5 items.
+- confidence in [0,1]. Use >=0.75 only when clearly stated by user.
+- Do NOT store generic questions like "explain normalization", keep it user oriented.
+- If no durable info, return empty memories: [].
 
 User memory context:
 {chr(10).join(context_lines)}
@@ -69,46 +93,44 @@ User message:
 {req.message}
 """.strip()
 
-    # 3) Call Gemini once
-    with timed("llm_call_gemini", trace):
-        try:
-            answer = gemini_answer(GEMINI_API_KEY, prompt)
-        except Exception as e:
-            answer = f"[LLM ERROR] {str(e)}"
 
-    # 4) Extract "important memories" (Gemini)
-    from .llm_gemini import gemini_extract_memories
+    # 3) One Groq call: answer + extracted memories
+    with timed("llm_call_groq", trace):
+        result = groq_answer_and_memories(GROQ_API_KEY, GROQ_MODEL, prompt)
 
+    answer = result.get("answer", "")
+    extracted = result.get("memories", [])
+
+    dbg = result.get("debug", {})
+    trace.append({
+        "stage": "groq_io",
+        "status": "ok",
+        "model": dbg.get("model"),
+        "usage": dbg.get("usage"),
+        "http_preview_len": len(dbg.get("raw_http_text", "") or ""),
+        "prompt_preview": (dbg.get("prompt","")[:1200]),  # avoid huge UI spam
+        "raw_preview": (dbg.get("raw_content","")[:1200]),
+    })
+
+    # 4) Store extracted memories (threshold)
     MEMORY_CONF_THRESHOLD = 0.75
-    ALLOWED_KINDS = {"fact", "goal", "preference", "weakness", "strength", "constraint"}
 
-    with timed("extract_memories_llm", trace):
-        extracted = []
-        try:
-            extracted = gemini_extract_memories(GEMINI_API_KEY, req.message)
-        except Exception as e:
-            trace.append({"stage": "extract_memories_llm", "status": "error", "error": str(e)})
-
-    # 5) Store extracted memories
     with timed("store_memories", trace):
         stored = []
         for m in extracted:
-            try:
-                text = (m.get("text") or "").strip()
-                kind = (m.get("kind") or "").strip()
-                conf = float(m.get("confidence") or 0.0)
+            text = (m.get("text") or "").strip()
+            kind = (m.get("kind") or "").strip()
+            conf = float(m.get("confidence") or 0.0)
 
-                if not text or kind not in ALLOWED_KINDS or conf < MEMORY_CONF_THRESHOLD:
-                    continue
+            if not text or conf < MEMORY_CONF_THRESHOLD:
+                continue
 
-                neo.add_memory(user_id, make_memory(text, kind=kind, source="chat", confidence=conf))
-                stored.append({"text": text, "kind": kind, "confidence": conf})
-            except Exception as e:
-                trace.append({"stage": "store_memories", "status": "error", "error": str(e), "item": m})
+            neo.add_memory(user_id, make_memory(text, kind=kind, source="chat", confidence=conf))
+            stored.append({"text": text, "kind": kind, "confidence": conf})
 
     trace.append({"stage": "stored_memories", "status": "ok", "count": len(stored), "items": stored[:5]})
 
-    # 6) Citations = retrieved memories (top few)
+    # 5) citations = retrieved memories (top few)
     citations = []
     for i, m in enumerate(memories[:5]):
         citations.append(MemoryCitation(
@@ -117,7 +139,7 @@ User message:
             score=1.0 - (i * 0.05)
         ))
 
-    # 7) timings
+    # timings
     def last_ms(stage: str) -> int:
         ms = 0
         for x in trace:
@@ -126,7 +148,7 @@ User message:
         return ms
 
     retrieval_ms = last_ms("retrieve_memories")
-    llm_ms = last_ms("llm_call_gemini")
+    llm_ms = last_ms("llm_call_groq")
 
     return ChatResp(
         answer=answer,
@@ -135,6 +157,7 @@ User message:
         memory_citations=citations,
         debug_trace=trace
     )
+
 
 @app.get("/health")
 def health():

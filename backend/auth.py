@@ -44,6 +44,10 @@ def verify_user(username: str, password: str) -> str | None:
     return user_id if pbkdf2_sha256.verify(password, pw_hash) else None
 
 def new_session(user_id: str) -> str:
+    # invalidate old tokens for this user
+    for t, uid in list(SESSIONS.items()):
+        if uid == user_id:
+            del SESSIONS[t]
     token = str(uuid.uuid4())
     SESSIONS[token] = user_id
     return token
